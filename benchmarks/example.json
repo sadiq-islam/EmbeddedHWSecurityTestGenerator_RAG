@@ -1,0 +1,28 @@
+{
+  "dataset_id": "replace-with-reviewed-hardware-benchmark",
+  "version": "example-only-1",
+  "annotation_status": "TEMPLATE: replace objectives and labels; these are not measured cases",
+  "cases": [
+    {
+      "id": "debug-lock-dev-001",
+      "pdf": "manual.pdf",
+      "split": "dev",
+      "objective": "Draft a verification procedure for documented production debug lock behavior, or abstain if the manual lacks the procedure or acceptance criteria.",
+      "answerable": true,
+      "reference_evidence": [
+        {"evidence_id": "ref-001", "pages": [7], "section": "REPLACE", "quote": "REPLACE with exact reviewed manual text"}
+      ],
+      "expected_behaviors": ["REPLACE with a documented testable behavior"]
+    },
+    {
+      "id": "missing-evidence-dev-002",
+      "pdf": "manual.pdf",
+      "split": "dev",
+      "objective": "REPLACE with an objective whose required procedure or acceptance criteria are missing from this manual.",
+      "answerable": false,
+      "reference_evidence": [],
+      "expected_behaviors": [],
+      "missing_information": ["REPLACE with the specific missing documentation"]
+    }
+  ]
+}

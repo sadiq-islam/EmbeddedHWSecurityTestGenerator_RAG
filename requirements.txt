@@ -1,0 +1,10 @@
+streamlit
+groq
+sentence-transformers
+faiss-cpu
+pydantic>=2
+python-dotenv
+pymupdf
+docling
+docling-core[chunking]
+tiktoken
