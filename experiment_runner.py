@@ -22,6 +22,8 @@ from src.chatbot import HardwarePlanner
 
 
 def read_benchmark(path):
+    # Enforces strict structure upon input benchmarks to stop corrupt batches
+    # before compute costs are incurred.
     dataset = json.loads(Path(path).read_text(encoding="utf-8"))
     if not dataset.get("dataset_id") or not dataset.get("version"):
         raise ValueError("Benchmark needs dataset_id and version")
@@ -51,9 +53,12 @@ def evaluate_case(planner, store, case, repeat):
     planner.init_chat()
     before = len(planner.calls)
     started = perf_counter()
+
+    # Telemetry wrapper
     record = {"case_id": case["id"], "repeat": repeat, "case": case,
               "status": "started", "output": None, "call": None,
               "human_scores": None, "cost": None, "peak_memory_bytes": None}
+
     try:
         answer, _ = planner.chat(case["objective"], store=store, fresh=True,
                                  retrieval_query=case.get("retrieval_query"))
@@ -62,6 +67,7 @@ def evaluate_case(planner, store, case, repeat):
         # Do not persist arbitrary provider exception strings that might contain
         # request/credential details. Raw partial output remains in call records.
         record.update(status="failed", error_type=type(exc).__name__)
+
     record["case_seconds"] = perf_counter() - started
     if len(planner.calls) > before:
         record["call"] = planner.calls[-1]
@@ -69,6 +75,7 @@ def evaluate_case(planner, store, case, repeat):
 
 
 def environment():
+    # Snapshots dependencies for experiment traceabilty to identify run drifts
     packages = {}
     for name in ["docling", "docling-core", "sentence-transformers", "transformers",
                  "torch", "faiss-cpu", "groq", "numpy", "tiktoken", "streamlit"]:
@@ -76,6 +83,7 @@ def environment():
             packages[name] = metadata.version(name)
         except metadata.PackageNotFoundError:
             packages[name] = None
+
     return {"python": sys.version, "platform": platform.platform(),
             "processor": platform.processor(), "cpu_count": os.cpu_count(),
             "packages": packages, "device": "cpu"}
@@ -84,27 +92,36 @@ def environment():
 def run(args):
     benchmark_path = Path(args.benchmark).resolve()
     dataset = read_benchmark(benchmark_path)
+
     if dataset.get("annotation_status") != "human_reviewed":
         raise ValueError("Replace template labels and set annotation_status to human_reviewed")
+
     cases = [c for c in dataset["cases"] if args.split == "all" or c["split"] == args.split]
     if not cases or args.repeats < 1:
         raise ValueError("Need selected cases and repeats >= 1")
+
     configurations = [
         RetrievalConfig(top_k=args.top_k, candidate_k=args.candidate_k,
                         chunk_tokens=args.chunk_tokens, overlap_tokens=args.overlap_tokens,
                         rerank=rerank) for rerank in
         ([False, True] if args.variant == "both" else [args.variant == "dense_rerank"])]
+
     generation = GenerationConfig(model=args.model, max_output_tokens=args.max_output_tokens,
                                   context_tokens=args.context_tokens)
+
     # Fail before any downloads if no credentials are configured.
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent / ".env")
     key = os.getenv("GROQ_API_KEY", "")
     if not key.strip():
         raise ValueError("Set GROQ_API_KEY before running live experiments")
+
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)  # Never silently overwrite results.
+
     source_root = Path(__file__).resolve().parent
+
+    # Establish a locked baseline manifest for auditing
     manifest = {"schema_version": 1, "started_at": datetime.now(timezone.utc).isoformat(),
                 "benchmark_sha256": sha256(benchmark_path.read_bytes()).hexdigest(),
                 "dataset": dataset, "split": args.split, "repeats": args.repeats,
@@ -117,40 +134,53 @@ def run(args):
                                 "No cost or peak memory measurement implemented",
                                 "Context token counter is a proxy; provider usage is authoritative",
                                 "Fixed configured model names may resolve to mutable provider versions"]}
+
     manifest_path = output / "manifest.json"
+
     def save_manifest():
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
     save_manifest()
     planner = None
+
     try:
         planner = HardwarePlanner(api_key=key, config=generation)
         manifest["generation_settings"] = planner.settings()
+
         started = perf_counter()
         embedder = load_embedder()
         manifest["embedder_load_seconds"] = perf_counter() - started
         save_manifest()
+
         with (output / "results.jsonl").open("w", encoding="utf-8") as results:
             # Parse each document ONCE and reuse exactly the same chunks/index.
             for pdf_name in dict.fromkeys(c["pdf"] for c in cases):
                 pdf_path = (benchmark_path.parent / pdf_name).resolve()
                 data = pdf_path.read_bytes()
                 started = perf_counter()
+
                 with PDFProcessor(data, source_name=pdf_path.name, max_pages=args.max_pages) as processor:
                     doc, chunks, pages = processor.extract_document()
+
                 parse_seconds = perf_counter() - started
                 store = VectorStore(embedder, configurations[0])
+
                 started = perf_counter()
                 store.build_index(chunks, processor.document_id, pdf_path.name)
                 index_seconds = perf_counter() - started
+
                 # Snapshot all records so references and chunk IDs can be reviewed.
                 evidence_file = f"evidence-{processor.document_id}.json"
                 (output / evidence_file).write_text(json.dumps(store.chunks, indent=2, ensure_ascii=False),
                                                    encoding="utf-8")
+
                 manifest["documents"][pdf_name] = {"sha256": processor.document_id,
                     "pages": pages, "parsed_pages": len(doc.pages), "chunks": len(store.chunks),
                     "parse_seconds": parse_seconds, "index_seconds": index_seconds,
                     "evidence_file": evidence_file, "retrieval_settings": store.settings()}
                 save_manifest()
+
+                # Batch execution loop
                 for config in configurations:
                     store.config = config
                     variant = "dense_rerank" if config.rerank else "dense"
@@ -159,14 +189,17 @@ def run(args):
                             record = evaluate_case(planner, store, case, repeat)
                             record.update(variant=variant, document_id=processor.document_id,
                                           retrieval_settings=store.settings())
+                            # Stream records to disk sequentially to survive abrupt crashes
                             results.write(json.dumps(record, ensure_ascii=False) + "\n")
                             results.flush()
                             print(f"{variant}: {case['id']} repeat={repeat} {record['status']}")
+
         manifest["status"] = "completed"
     except Exception as exc:
         manifest.update(status="failed", error_type=type(exc).__name__)
         raise
     finally:
+        # Guarantee closure
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
         save_manifest()
         if planner is not None:

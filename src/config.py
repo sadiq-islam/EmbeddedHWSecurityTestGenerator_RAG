@@ -12,6 +12,7 @@ class RetrievalConfig:
     batch_size: int = 32
 
     def __post_init__(self):
+        # Enforce basic sanity limits to prevent FAISS indexing errors or blank context
         if self.top_k < 1 or self.candidate_k < self.top_k:
             raise ValueError("Require candidate_k >= top_k >= 1")
         if self.chunk_tokens < 8 or not 0 <= self.overlap_tokens < self.chunk_tokens:
@@ -23,7 +24,7 @@ class RetrievalConfig:
 @dataclass(frozen=True)
 class GenerationConfig:
     model: str = "qwen/qwen3.8-27b"
-    temperature: float = 0.0
+    temperature: float = 0.0          # Deterministic retrieval mapping
     max_output_tokens: int = 2400
     context_tokens: int = 3000
     counter_encoding: str = "cl100k_base"
@@ -31,6 +32,7 @@ class GenerationConfig:
     max_history_turns: int = 6
 
     def __post_init__(self):
+        # Defend against downstream LLM context window crashes
         if self.max_output_tokens < 1 or self.context_tokens < 1:
             raise ValueError("Generation budgets must be positive")
         if self.max_history_turns < 0 or not 0 <= self.temperature <= 2:

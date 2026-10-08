@@ -14,6 +14,9 @@ from experiment_runner import evaluate_case, read_benchmark
 from experiment_runner import run
 
 
+# ---------------------------------------------------------
+# FAKE INJECTIONS FOR DETERMINISTIC OFFLINE TESTING
+# ---------------------------------------------------------
 class Tokenizer:
     # Character tokens deliberately force long technical strings to split.
     def encode(self, text, add_special_tokens=True):
@@ -22,16 +25,15 @@ class Tokenizer:
     def __call__(self, text, **kwargs):
         return {"offset_mapping": [(i, i + 1) for i in range(len(text))]}
 
-
 class Embedder:
     tokenizer = Tokenizer()
     max_seq_length = 80
 
     def encode(self, texts, **kwargs):
+        # Generate predictable vectors based on specific keywords for reranking checks
         vectors = np.array([[1 + t.lower().count("debug"),
                              1 + t.lower().count("voltage")] for t in texts], dtype=np.float32)
         return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
-
 
 class Position:
     def __init__(self, page):
@@ -41,23 +43,19 @@ class Position:
         return {"page_no": self.page, "bbox": {"l": 10, "t": 20, "r": 30, "b": 40},
                 "charspan": [0, 20]}
 
-
 def chunk(text="Debug access disabled in production.", pages=(2, 3), headings=("Security",)):
     items = [NS(self_ref=f"#/texts/{i}", label="text", prov=[Position(p)])
              for i, p in enumerate(pages)]
     return NS(text=text, meta=NS(headings=list(headings), doc_items=items))
-
 
 class Reranker:
     def predict(self, pairs):
         # Prefer the voltage passage to demonstrate actual ordering changes.
         return [10.0 if "voltage" in passage.lower() else -10.0 for _, passage in pairs]
 
-
 class Counter:
     def encode(self, text):
         return list(text)
-
 
 class FakeClient:
     api_key = "test-key"
@@ -77,7 +75,6 @@ class FakeClient:
     def close(self):
         pass
 
-
 class FakeStore:
     document_id = "manual-A"
     def search(self, query, final_top_k=None):
@@ -85,18 +82,24 @@ class FakeStore:
                  "text": "Debug disabled.", "pages": [2], "provenance": []}]
 
 
+# ---------------------------------------------------------
+# CORE BEHAVIORAL REGRESSION TESTS
+# ---------------------------------------------------------
 class ChunkTests(unittest.TestCase):
     def test_actual_docling_objects_and_fast_tokenizer(self):
+        # Validate integration boundaries with external tokenizers directly
         from docling_core.types.doc import DoclingDocument, ProvenanceItem, BoundingBox, DocItemLabel
         from docling_core.transforms.chunker.doc_chunk import DocChunk, DocMeta
         from tokenizers import Tokenizer as Backend, models, pre_tokenizers, processors
         from transformers import PreTrainedTokenizerFast
+
         backend = Backend(models.WordPiece(vocab={"[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
                                                    "debug": 3, "voltage": 4, "production": 5}))
         backend.pre_tokenizer = pre_tokenizers.Whitespace()
         backend.post_processor = processors.TemplateProcessing(
             single="[CLS] $A [SEP]", special_tokens=[("[CLS]", 1), ("[SEP]", 2)])
         tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+
         text = "debug voltage production " * 40
         document = DoclingDocument(name="test")
         item = document.add_text(label=DocItemLabel.TEXT, text=text,
@@ -105,6 +108,7 @@ class ChunkTests(unittest.TestCase):
                                         charspan=(0, len(text))))
         actual_chunk = DocChunk(text=text, meta=DocMeta(doc_items=[item], headings=["production"]))
         records = prepare_chunks([actual_chunk], tokenizer, 32, 4, "hash", "manual.pdf")
+
         self.assertGreater(len(records), 1)
         self.assertTrue(all(r["embedding_tokens"] <= 32 for r in records))
         self.assertTrue(all(r["pages"] == [2, 3] for r in records))
@@ -147,11 +151,13 @@ class ChunkTests(unittest.TestCase):
 
 class RetrievalTests(unittest.TestCase):
     def test_dense_never_loads_reranker_and_retains_cosine(self):
+        # Assert reranker code is absolutely skipped when explicitly turned off
         with patch("src.vector_store.load_reranker", side_effect=AssertionError("must not load")):
             store = VectorStore(Embedder(), RetrievalConfig(rerank=False, top_k=1,
                                 candidate_k=2, chunk_tokens=240, overlap_tokens=0))
             store.build_index([chunk("Debug debug", (7,), ()), chunk("Voltage voltage", (8,), ())], "hash")
             hit = store.search("Debug debug")[0]
+
         self.assertEqual(hit["pages"], [7])
         self.assertAlmostEqual(hit["score"], 1.0, places=5)
         self.assertEqual(hit["score_kind"], "cosine")
@@ -252,6 +258,7 @@ class ChatTests(unittest.TestCase):
                 read_benchmark(path)
 
     def test_runner_writes_both_variants_and_shared_evidence(self):
+        # Simulate an entire end-to-end benchmark execution in isolated files
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "manual.pdf").write_bytes(b"synthetic-pdf")
@@ -264,6 +271,7 @@ class ChatTests(unittest.TestCase):
                       variant="both", top_k=1, candidate_k=2, chunk_tokens=80, overlap_tokens=0,
                       model="fake", max_output_tokens=100, context_tokens=10000, max_pages=100)
             planner = self.planner()
+
             with patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}), \
                  patch("experiment_runner.HardwarePlanner", return_value=planner), \
                  patch("experiment_runner.load_embedder", return_value=Embedder()), \
@@ -271,6 +279,7 @@ class ChatTests(unittest.TestCase):
                  patch("src.pdf_processor.PDFProcessor.extract_document",
                        return_value=(NS(pages={1: object()}), [chunk(headings=())], 1)):
                 run(args)
+
             records = [json.loads(line) for line in (root / "results/results.jsonl").read_text().splitlines()]
             self.assertEqual(len(records), 4)
             self.assertEqual({r["variant"] for r in records}, {"dense", "dense_rerank"})

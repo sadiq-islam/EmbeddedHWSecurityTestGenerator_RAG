@@ -10,16 +10,18 @@ from src.config import RetrievalConfig
 from src.pdf_processor import PDFProcessor
 from src.vector_store import VectorStore, load_embedder
 
+# Environment secrets should never be logged
 load_dotenv(Path(__file__).resolve().parent / ".env")
 st.set_page_config(page_title="Hardware Planner Chat", layout="wide")
 
-
 @st.cache_resource
 def cached_embedder():
+    # Model caching avoids reloading sentence-transformers on every UI interaction
     return load_embedder()
 
 
 def reset_document():
+    # Ensures no ghost state leaks across distinct uploaded manuals
     st.session_state.vector_store = None
     st.session_state.chat_messages = []
     st.session_state.current_draft = ""
@@ -29,6 +31,7 @@ def reset_document():
 
 
 def show_sources(hits):
+    # Transparency rendering for document sources
     with st.expander("Document Sources & Evidence"):
         for hit in hits:
             pages = ", ".join(map(str, hit["pages"])) or "unknown"
@@ -39,16 +42,20 @@ def show_sources(hits):
             st.json(hit["provenance"])
 
 
+# Session State Initialization block
 for key, value in {"planner": None, "vector_store": None, "chat_messages": [],
                    "current_draft": "", "upload_id": None, "extraction_stats": None}.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 st.title("Embedded Hardware Security Test Planner")
+
 with st.sidebar:
     st.header("Document Setup")
     api_key = st.text_input("Groq API Key", type="password", value=os.getenv("GROQ_API_KEY", ""))
     planner = st.session_state.planner
+
+    # Manage Planner object lifecycle automatically on API key changes
     if api_key and (planner is None or planner.client.api_key != api_key):
         if planner:
             planner.close()
@@ -66,10 +73,14 @@ with st.sidebar:
     chunk_tokens = int(st.number_input("Embedding chunk tokens", min_value=32, max_value=256, value=240))
     overlap = int(st.number_input("Overlap tokens", min_value=0,
                                  max_value=chunk_tokens - 1, value=min(24, chunk_tokens - 1)))
+
     config = RetrievalConfig(top_k=top_k, candidate_k=candidate_k, rerank=rerank,
                              chunk_tokens=chunk_tokens, overlap_tokens=overlap)
+
     uploaded = st.file_uploader("Upload PDF Specification", type=["pdf"])
     data = uploaded.getvalue() if uploaded is not None else None
+
+    # Track file differences using sha256 to automatically reset memory if a new file arrives
     upload_id = sha256(data).hexdigest() if data is not None else None
     if upload_id != st.session_state.upload_id:
         reset_document()
@@ -88,6 +99,7 @@ with st.sidebar:
                     "Tables detected": len(doc.tables), "Indexed chunks": len(store.chunks)}
             except Exception as exc:
                 st.error(f"Document processing failed: {type(exc).__name__}")
+
     if st.session_state.extraction_stats:
         for label, value in st.session_state.extraction_stats.items():
             st.metric(label, value)
@@ -95,6 +107,7 @@ with st.sidebar:
 
 store = st.session_state.vector_store
 if store:
+    # State validation: Disable chats if chunk configs mutate after processing the doc
     if (store.config.chunk_tokens, store.config.overlap_tokens) != (chunk_tokens, overlap):
         st.warning("Chunk settings changed. Process the document again before chatting.")
         ready = False
@@ -104,9 +117,11 @@ if store:
 else:
     ready = False
 
+# Enable exporting validated results directly to markdown
 if st.session_state.current_draft:
     st.sidebar.download_button("Download Current Draft (.md)", st.session_state.current_draft,
                                file_name="test_draft.md", mime="text/markdown")
+
 for message in st.session_state.chat_messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -120,16 +135,21 @@ if prompt := st.chat_input("Ask about the specs or request a proposed test...",
     try:
         with st.chat_message("assistant"), st.spinner("Retrieving and generating..."):
             response, hits = st.session_state.planner.chat(prompt, store=store)
+
+            # Post-processing: Handle automated payload tags without rendering them to the user
             response = response.replace("[DOWNLOAD_READY]", "").strip()
             draft = re.search(r"```markdown\s*\n(.*?)```", response, re.DOTALL)
             if draft:
                 st.session_state.current_draft = draft.group(1).strip()
+
             st.markdown(response)
             if hits:
                 show_sources(hits)
+
         st.session_state.chat_messages.extend([
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": response, "sources": hits}])
+
         # Rerun makes the newly created download button available immediately.
         st.rerun()
     except Exception as exc:
